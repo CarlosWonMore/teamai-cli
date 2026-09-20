@@ -48,6 +48,18 @@ function shellQuoteValue(value: string): string {
 }
 
 /**
+ * True for a path a shell must read the Windows way: a drive-letter path
+ * (`C:\...` or `C:/...`) or a UNC path (`\\server\share`).
+ *
+ * A POSIX path is deliberately excluded: there a backslash is an ordinary
+ * filename character, not a separator, so collapsing every one of them would
+ * silently point the shell at a different directory.
+ */
+function isWindowsFormPath(value: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\');
+}
+
+/**
  * Read back the assignments `generateEnvFile` writes, as key → value.
  *
  * The inverse of the generator, and it has to be: a YAML block scalar is a
@@ -313,20 +325,21 @@ export class EnvHandler extends ResourceHandler {
    * tested a backslash path the shell treats as an escape sequence, and
    * `source` never ran — while nothing reported a failure (#661).
    *
-   * Two unconditional transforms, both deliberate:
+   * A Windows-form home is rewritten to forward slashes, which Git Bash, WSL
+   * and MSYS all accept, so one block loads on every shell the CLI supports.
+   * The rewrite keys off the path's own shape, never `path.sep`, so the output
+   * is byte-identical across platforms and the Windows form stays assertable
+   * from the Linux/macOS CI runners. A POSIX home is passed through untouched:
+   * its backslashes are filename characters, not separators.
    *
-   * - `\` → `/`: Git Bash, WSL and MSYS all accept the forward-slash form,
-   *   and normalising without consulting `path.sep` keeps the output
-   *   byte-identical on every platform, so the Windows shape is assertable
-   *   from the Linux/macOS CI runners.
-   * - `shellQuoteValue`: the path is machine-dependent and this is inside a
-   *   `[ -f ... ]` test, so an unquoted space (or glob metacharacter) in a
-   *   home directory would break the test and split the `source` builtin.
-   *   Quoting only "when needed" would make the emitted shape depend on the
-   *   path and put the quoted form out of reach of the runner.
+   * The path is quoted unconditionally (`shellQuoteValue`). It sits inside a
+   * `[ -f ... ]` test, so an unquoted space or glob metacharacter in a home
+   * directory would break that test and split the `source` builtin. Quoting
+   * only "when needed" would put the quoted form out of reach of the runner.
    */
   generateShellBlock(teamaiHome: string): string {
-    const envShPath = shellQuoteValue(`${teamaiHome.replace(/\\/g, '/')}/env.sh`);
+    const shellHome = isWindowsFormPath(teamaiHome) ? teamaiHome.replace(/\\/g, '/') : teamaiHome;
+    const envShPath = shellQuoteValue(`${shellHome}/env.sh`);
     const lines = [
       TEAMAI_ENV_START,
       '# DO NOT EDIT: This section is auto-managed by teamai',

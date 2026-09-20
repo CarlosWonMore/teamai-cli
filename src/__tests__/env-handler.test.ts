@@ -25,10 +25,13 @@ vi.mock('../utils/logger.js', () => ({
  * separator: the real path is machine-dependent (`C:\Users\...` on Windows,
  * `/home/...` elsewhere) and the block is asserted from CI runners that are
  * never Windows, so the expectation has to normalise the same way the source
- * does — `\` → `/`, unconditionally.
+ * does. Only Windows-form paths are rewritten — a POSIX home keeps its
+ * backslashes, which are filename characters there, not separators.
  */
 const expectedSourceLine = (teamaiHome: string): string => {
-  const envShPath = `'${teamaiHome.replace(/\\/g, '/')}/env.sh'`;
+  const isWindowsForm = /^[A-Za-z]:[\\/]/.test(teamaiHome) || teamaiHome.startsWith('\\\\');
+  const shellHome = isWindowsForm ? teamaiHome.replace(/\\/g, '/') : teamaiHome;
+  const envShPath = `'${shellHome}/env.sh'`;
   return `[ -f ${envShPath} ] && source ${envShPath}`;
 };
 
@@ -219,6 +222,17 @@ scope: 'user',
 
       expect(block).toContain(
         "[ -f 'C:/Users/me/.teamai/env.sh' ] && source 'C:/Users/me/.teamai/env.sh'",
+      );
+    });
+
+    it('leaves a backslash in a POSIX home alone', () => {
+      // On POSIX a backslash is an ordinary filename character; collapsing it
+      // would point the block at a different directory (bot review on #680).
+      const block = handler.generateShellBlock('/home/a\\b/.teamai');
+
+      expect(block).toContain(expectedSourceLine('/home/a\\b/.teamai'));
+      expect(block).toContain(
+        "[ -f '/home/a\\b/.teamai/env.sh' ] && source '/home/a\\b/.teamai/env.sh'",
       );
     });
 
