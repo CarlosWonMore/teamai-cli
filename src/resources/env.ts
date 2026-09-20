@@ -306,12 +306,31 @@ export class EnvHandler extends ResourceHandler {
 
   /**
    * Generate the shell block with a source line (instead of inline exports).
+   *
+   * The block is read back by a POSIX shell (bash/zsh/sh) even on Windows,
+   * where `teamaiHome` is a native path such as `C:\Users\me\.teamai`. The
+   * block used to interpolate that path as-is, so on Windows `[ -f ... ]`
+   * tested a backslash path the shell treats as an escape sequence, and
+   * `source` never ran — while nothing reported a failure (#661).
+   *
+   * Two unconditional transforms, both deliberate:
+   *
+   * - `\` → `/`: Git Bash, WSL and MSYS all accept the forward-slash form,
+   *   and normalising without consulting `path.sep` keeps the output
+   *   byte-identical on every platform, so the Windows shape is assertable
+   *   from the Linux/macOS CI runners.
+   * - `shellQuoteValue`: the path is machine-dependent and this is inside a
+   *   `[ -f ... ]` test, so an unquoted space (or glob metacharacter) in a
+   *   home directory would break the test and split the `source` builtin.
+   *   Quoting only "when needed" would make the emitted shape depend on the
+   *   path and put the quoted form out of reach of the runner.
    */
   generateShellBlock(teamaiHome: string): string {
+    const envShPath = shellQuoteValue(`${teamaiHome.replace(/\\/g, '/')}/env.sh`);
     const lines = [
       TEAMAI_ENV_START,
       '# DO NOT EDIT: This section is auto-managed by teamai',
-      `[ -f ${teamaiHome}/env.sh ] && source ${teamaiHome}/env.sh`,
+      `[ -f ${envShPath} ] && source ${envShPath}`,
       TEAMAI_ENV_END,
     ];
     return lines.join('\n');
