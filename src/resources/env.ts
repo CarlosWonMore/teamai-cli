@@ -24,6 +24,41 @@ export type EnvVariable = z.infer<typeof EnvVariableSchema>;
 export type EnvYaml = z.infer<typeof EnvYamlSchema>;
 
 /**
+ * Report the one env.yaml shape mistake zod cannot surface on its own: a
+ * mapping that has no top-level `variables:` key but does have at least one
+ * other top-level key. That is what a bare `FOO: bar` list looks like, and
+ * also what a misspelling looks like.
+ *
+ * `variables` is declared with `.default([])`, and zod drops unknown keys
+ * without a word, so such a file parses cleanly as "no variables" and
+ * `pullItem` returns early at the length check: every env variable silently
+ * stops being delivered, with nothing in the output explaining why (#662).
+ *
+ * Only this shape is reported. Every other shape stays permissive on purpose —
+ * most importantly a valid `variables:` list that also carries an extra
+ * top-level key, which must keep being delivered rather than start failing to
+ * parse.
+ *
+ * @returns the warning to log, or `null` when there is nothing to report.
+ */
+export function describeEnvYamlShapeProblem(raw: unknown): string | null {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+
+  const keys = Object.keys(raw as Record<string, unknown>);
+  if (keys.length === 0 || keys.includes('variables')) return null;
+
+  return [
+    'env.yaml has no top-level `variables:` key, so no environment variable was delivered.',
+    `Top-level keys found instead: ${keys.map(k => `\`${k}\``).join(', ')}.`,
+    '`variables:` must be present and hold a list of `key`/`value` entries, e.g.',
+    '',
+    '  variables:',
+    '    - key: FOO',
+    '      value: bar',
+  ].join('\n');
+}
+
+/**
  * Mask an env variable value for display.
  * Shows first 2 chars + "****", or "****" for very short values.
  */
@@ -144,6 +179,11 @@ export class EnvHandler extends ResourceHandler {
     let envConfig: EnvYaml;
     try {
       const raw = YAML.parse(content);
+      // Warn before parsing: the schema is deliberately permissive, so a file
+      // with no `variables:` key parses to an empty list and the early return
+      // below would otherwise be invisible. See describeEnvYamlShapeProblem.
+      const shapeProblem = describeEnvYamlShapeProblem(raw);
+      if (shapeProblem) log.warn(shapeProblem);
       envConfig = EnvYamlSchema.parse(raw);
     } catch (e) {
       log.warn(`Invalid env.yaml format: ${(e as Error).message}`);

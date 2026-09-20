@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
 import YAML from 'yaml';
-import { EnvHandler } from '../resources/env.js';
+import { EnvHandler, describeEnvYamlShapeProblem } from '../resources/env.js';
 import { TEAMAI_ENV_START, TEAMAI_ENV_END } from '../types.js';
 import type { TeamaiConfig, LocalConfig, ResourceItem } from '../types.js';
 
@@ -128,6 +128,41 @@ scope: 'user',
   });
 
   // ─── writeEnvYaml ────────────────────────────────────────
+
+  // ─── describeEnvYamlShapeProblem ─────────────────────────
+
+  describe('describeEnvYamlShapeProblem', () => {
+    it('reports a mapping with no variables key but other top-level keys', () => {
+      const warning = describeEnvYamlShapeProblem({ FOO: 'bar', BAZ: 'qux' });
+
+      expect(warning).toContain('no top-level `variables:` key');
+      expect(warning).toContain('`FOO`');
+      expect(warning).toContain('`BAZ`');
+      expect(warning).toContain('`key`/`value`');
+    });
+
+    it('stays silent for a valid variables list', () => {
+      expect(describeEnvYamlShapeProblem({ variables: [{ key: 'A', value: 'b' }] })).toBeNull();
+    });
+
+    it('stays silent when an extra top-level key rides along with variables', () => {
+      // Must stay permissive: a team repo already shipping this shape has to
+      // keep delivering rather than start failing to parse.
+      expect(describeEnvYamlShapeProblem({ variables: [], extra: true })).toBeNull();
+    });
+
+    it('stays silent for an empty or absent mapping', () => {
+      expect(describeEnvYamlShapeProblem({})).toBeNull();
+      expect(describeEnvYamlShapeProblem(null)).toBeNull();
+      expect(describeEnvYamlShapeProblem(undefined)).toBeNull();
+    });
+
+    it('stays silent for documents that are not mappings', () => {
+      expect(describeEnvYamlShapeProblem([])).toBeNull();
+      expect(describeEnvYamlShapeProblem('FOO=bar')).toBeNull();
+      expect(describeEnvYamlShapeProblem(42)).toBeNull();
+    });
+  });
 
   describe('writeEnvYaml', () => {
     it('should write env.yaml correctly', async () => {
@@ -433,6 +468,38 @@ scope: 'user',
       // Should not crash and should not modify shell profile
       const content = await fse.readFile(bashrcPath, 'utf-8');
       expect(content).toBe('# original\n');
+    });
+
+    it('warns and delivers nothing when `variables:` is missing but other keys are present', async () => {
+      // The shape zod used to swallow: a bare key/value mapping. The file
+      // parses cleanly, so the pull looked successful while nothing shipped,
+      // and no output said why (#662).
+      const shapeYamlPath = path.join(repoPath, 'env', 'shape.yaml');
+      await fse.writeFile(shapeYamlPath, 'FOO: bar\nBAZ: qux\n');
+
+      const shapeItem: ResourceItem = {
+        name: 'shape.yaml',
+        type: 'env',
+        sourcePath: shapeYamlPath,
+        relativePath: 'env/shape.yaml',
+      };
+
+      vi.stubEnv('SHELL', '/bin/bash');
+      const bashrcPath = path.join(homeDir, '.bashrc');
+      await fse.writeFile(bashrcPath, '# original\n');
+
+      const { log } = await import('../utils/logger.js');
+      vi.mocked(log.warn).mockClear();
+
+      await handler.pullItem(shapeItem, teamConfig, localConfig);
+
+      expect(log.warn).toHaveBeenCalledWith(
+        expect.stringContaining('no top-level `variables:` key'),
+      );
+      // Nothing is written — but now the reason is on the record instead of
+      // being inferable only from an empty env.sh.
+      expect(await fse.pathExists(path.join(homeDir, '.teamai', 'env.sh'))).toBe(false);
+      expect(await fse.readFile(bashrcPath, 'utf-8')).toBe('# original\n');
     });
   });
 
