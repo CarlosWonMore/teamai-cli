@@ -70,7 +70,7 @@ vi.mock('../doctor.js', async (importOriginal) => ({
   buildChecks: vi.fn(),
 }));
 
-import { detectProjectConfig, loadLocalConfigForScope, loadTeamConfig } from '../config.js';
+import { detectProjectConfig, loadLocalConfigForScope, loadStateForScope, loadTeamConfig, saveStateForScope } from '../config.js';
 import { acquireLock } from '../update.js';
 import { buildChecks, resolveDoctorContext, type DoctorContext } from '../doctor.js';
 import { log } from '../utils/logger.js';
@@ -83,6 +83,10 @@ describe('env.yaml shape warning on a real pull', () => {
   let tempDir: string;
   let homeDir: string;
   let repoPath: string;
+  // The object `loadStateForScope` hands out. pull() mutates it in place before
+  // saving, so holding the reference is what lets a second pull see the rev the
+  // first one recorded — no guessing at the resolved target set.
+  let state: Record<string, unknown>;
 
   beforeEach(async () => {
     tempDir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-pull-env-shape-'));
@@ -121,6 +125,8 @@ describe('env.yaml shape warning on a real pull', () => {
     vi.mocked(detectProjectConfig).mockResolvedValue(null);
     vi.mocked(loadLocalConfigForScope).mockResolvedValue(localConfig);
     vi.mocked(loadTeamConfig).mockResolvedValue(teamConfig);
+    state = { lastPull: null, lastPullRev: null };
+    vi.mocked(loadStateForScope).mockResolvedValue(state as never);
 
     const ctx: DoctorContext = {
       localConfig,
@@ -170,5 +176,28 @@ describe('env.yaml shape warning on a real pull', () => {
     await pull({ force: true });
 
     expect(log.warn).not.toHaveBeenCalledWith(expect.stringContaining(SHAPE_WARNING));
+  });
+
+  it('warns from the unchanged-rev fast path too', async () => {
+    // The machine pulled once while the CLI still accepted a bad shape, so it
+    // stored the rev. The repo has not moved since — every later pull takes the
+    // "Already synced" branch and returns before Step 2. Without the check on
+    // that branch the warning is unreachable for exactly the users it is for.
+    await fse.outputFile(path.join(repoPath, 'env', 'env.yaml'), 'FOO: bar\n');
+
+    // First pull: full sync, stores the rev and the target set.
+    await pull({});
+    expect(state.lastPullRev).toBe('abc1234');
+
+    vi.mocked(log.warn).mockClear();
+    vi.mocked(log.success).mockClear();
+
+    // Second pull: same rev, same target set — the fast path.
+    await pull({});
+
+    // Pins that the fast path really was taken, so the warning below cannot
+    // have come from the Step 2 site.
+    expect(log.success).toHaveBeenCalledWith(expect.stringContaining('Already synced'));
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining(SHAPE_WARNING));
   });
 });
