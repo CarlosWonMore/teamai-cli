@@ -826,7 +826,16 @@ async function pullForScope(
     if (type === 'env') {
       const envHandler = handler as EnvHandler;
       const varCount = await envHandler.countEnvVars(items[0].sourcePath);
-      if (varCount === 0) continue;
+      if (varCount === 0) {
+        // Report the one shape that makes a count of 0 a mistake rather than an
+        // empty file: no top-level `variables:` key, which zod accepts without
+        // a word. The resource is skipped right here, so this is the only point
+        // a check can run from — inside `pullItem` it would never execute on a
+        // real pull, and the misconfiguration would stay invisible (#662).
+        const shapeProblem = await envHandler.describeEnvYamlShapeProblemAt(items[0].sourcePath);
+        if (shapeProblem) log.warn(shapeProblem);
+        continue;
+      }
 
       if (options.dryRun) {
         log.info(`[${scopeLabel}] [dry-run] Would sync ${varCount} env variable(s)`);

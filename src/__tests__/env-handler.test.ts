@@ -470,36 +470,39 @@ scope: 'user',
       expect(content).toBe('# original\n');
     });
 
-    it('warns and delivers nothing when `variables:` is missing but other keys are present', async () => {
+    it('reports the missing `variables:` key from a real env.yaml file', async () => {
       // The shape zod used to swallow: a bare key/value mapping. The file
-      // parses cleanly, so the pull looked successful while nothing shipped,
-      // and no output said why (#662).
+      // parses cleanly, so the pull looked successful while nothing shipped
+      // (#662). `pullForScope` reads it through this method, because it skips
+      // the resource before `pullItem` — where the check used to live — runs.
       const shapeYamlPath = path.join(repoPath, 'env', 'shape.yaml');
       await fse.writeFile(shapeYamlPath, 'FOO: bar\nBAZ: qux\n');
 
-      const shapeItem: ResourceItem = {
-        name: 'shape.yaml',
-        type: 'env',
-        sourcePath: shapeYamlPath,
-        relativePath: 'env/shape.yaml',
-      };
+      const problem = await handler.describeEnvYamlShapeProblemAt(shapeYamlPath);
 
-      vi.stubEnv('SHELL', '/bin/bash');
-      const bashrcPath = path.join(homeDir, '.bashrc');
-      await fse.writeFile(bashrcPath, '# original\n');
+      expect(problem).toContain('no top-level `variables:` key');
+      expect(problem).toContain('`FOO`');
+      expect(problem).toContain('`BAZ`');
+    });
 
-      const { log } = await import('../utils/logger.js');
-      vi.mocked(log.warn).mockClear();
+    it('reports nothing for a usable, empty, malformed or missing env.yaml', async () => {
+      const okPath = path.join(repoPath, 'env', 'ok.yaml');
+      await fse.writeFile(okPath, YAML.stringify({ variables: [{ key: 'A', value: 'b' }] }));
+      expect(await handler.describeEnvYamlShapeProblemAt(okPath)).toBeNull();
 
-      await handler.pullItem(shapeItem, teamConfig, localConfig);
+      const emptyPath = path.join(repoPath, 'env', 'empty.yaml');
+      await fse.writeFile(emptyPath, YAML.stringify({ variables: [] }));
+      expect(await handler.describeEnvYamlShapeProblemAt(emptyPath)).toBeNull();
 
-      expect(log.warn).toHaveBeenCalledWith(
-        expect.stringContaining('no top-level `variables:` key'),
-      );
-      // Nothing is written — but now the reason is on the record instead of
-      // being inferable only from an empty env.sh.
-      expect(await fse.pathExists(path.join(homeDir, '.teamai', 'env.sh'))).toBe(false);
-      expect(await fse.readFile(bashrcPath, 'utf-8')).toBe('# original\n');
+      // Malformed YAML is a separate failure and must not be dressed up as a
+      // shape problem.
+      const brokenPath = path.join(repoPath, 'env', 'broken.yaml');
+      await fse.writeFile(brokenPath, 'variables: [unclosed\n');
+      expect(await handler.describeEnvYamlShapeProblemAt(brokenPath)).toBeNull();
+
+      expect(
+        await handler.describeEnvYamlShapeProblemAt(path.join(repoPath, 'env', 'absent.yaml')),
+      ).toBeNull();
     });
   });
 

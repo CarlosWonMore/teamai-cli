@@ -30,9 +30,14 @@ export type EnvYaml = z.infer<typeof EnvYamlSchema>;
  * also what a misspelling looks like.
  *
  * `variables` is declared with `.default([])`, and zod drops unknown keys
- * without a word, so such a file parses cleanly as "no variables" and
- * `pullItem` returns early at the length check: every env variable silently
- * stops being delivered, with nothing in the output explaining why (#662).
+ * without a word, so such a file parses cleanly as "no variables": every env
+ * variable silently stops being delivered, with nothing in the output
+ * explaining why (#662).
+ *
+ * Reported from `pullForScope`, which is the only place that can — it skips
+ * the env resource as soon as `countEnvVars` reports 0, so the check cannot
+ * live in `pullItem`. `describeEnvYamlShapeProblemAt` reads the file and
+ * applies this to it.
  *
  * Only this shape is reported. Every other shape stays permissive on purpose —
  * most importantly a valid `variables:` list that also carries an extra
@@ -179,11 +184,6 @@ export class EnvHandler extends ResourceHandler {
     let envConfig: EnvYaml;
     try {
       const raw = YAML.parse(content);
-      // Warn before parsing: the schema is deliberately permissive, so a file
-      // with no `variables:` key parses to an empty list and the early return
-      // below would otherwise be invisible. See describeEnvYamlShapeProblem.
-      const shapeProblem = describeEnvYamlShapeProblem(raw);
-      if (shapeProblem) log.warn(shapeProblem);
       envConfig = EnvYamlSchema.parse(raw);
     } catch (e) {
       log.warn(`Invalid env.yaml format: ${(e as Error).message}`);
@@ -231,6 +231,28 @@ export class EnvHandler extends ResourceHandler {
       return envConfig.variables.length;
     } catch {
       return 0;
+    }
+  }
+
+  /**
+   * Read an env.yaml and report the shape problem `describeEnvYamlShapeProblem`
+   * detects, or `null` when the file yields a usable shape.
+   *
+   * `countEnvVars` answers the different question of "how many variables", and
+   * a file with no `variables:` key answers 0 just like a genuinely empty one —
+   * which is why the caller needs this separate probe before it skips the
+   * resource.
+   */
+  async describeEnvYamlShapeProblemAt(sourcePath: string): Promise<string | null> {
+    const content = await readFileSafe(sourcePath);
+    if (!content) return null;
+
+    try {
+      return describeEnvYamlShapeProblem(YAML.parse(content));
+    } catch {
+      // Malformed YAML never yields a mapping to inspect; it is a separate
+      // failure, left to the caller's own handling.
+      return null;
     }
   }
 
