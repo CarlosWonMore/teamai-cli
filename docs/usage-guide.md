@@ -332,8 +332,10 @@ explicit `--project` skips the picker.
 - **Backward compatible.** A repo without `manifest/projects.yaml` behaves exactly
   as before; existing flat `learnings/*.md` stay shared with everyone (zero
   migration).
-- **`teamai contribute`** lands a learning under the active project's subdirectory
-  when exactly one project is active, otherwise at the shared root.
+- **`teamai contribute`** defaults to `learnings/<namespace>/` when the active
+  projects resolve to exactly one learnings namespace, otherwise to the shared
+  root. Pass `--namespace <ns>` to choose one of those active namespaces;
+  `teamai projects list` shows the default destination and accepted namespaces.
 
 `manifest/projects.yaml` example:
 
@@ -1396,7 +1398,15 @@ You can also specify a file manually:
 ```bash
 teamai contribute --file /tmp/session.md
 teamai contribute --file /tmp/session.md --scope project
+teamai contribute --file /tmp/session.md --namespace payments
 ```
+
+`--namespace` accepts only the selected scope's active learnings namespaces from
+`manifest/projects.yaml`, which can differ from project ids. An unavailable or
+unsafe namespace is rejected before the learning is queued. Without the flag,
+the default above is unchanged; when several namespaces are active the command
+lists them and explains how to choose one. `--dry-run` previews the selected
+path without writing, and an offline contribution keeps that path when retried.
 
 #### Turning the hint off
 
@@ -1933,7 +1943,7 @@ If core graph extraction or writing fails, the import reports an error without m
 
 With `--dry-run`, `--from-repo` and `--from-repo-list` read each repo's target commit with `git ls-remote`, print `Would import <owner>/<repo> at <commit>` and whether the local cache is current, and stop there: nothing is cloned or fetched into the cache, the import lock is not taken, and no AI step runs. With `--incremental` and a cache containing `LAST_SYNC`, the preview queries that cache's current branch at its configured origin, matching the real fetch/reset. Full-clone previews, including a missing cache or `LAST_SYNC`, follow remote HEAD. If the cached branch was deleted remotely, a non-pruning wildcard fetch retains its cached origin ref; incremental preview uses that retained commit too. Pruning, an explicit deleted-branch fetch refspec, or a missing cached origin ref still selects the full-clone fallback. Other cached-branch query failures warn and preview the full-clone fallback. With `--output`, the preview reports the same `teamwiki/evidence/code/<slug>` destination beside the output file as a real import.
 
-`--from-mr` publishes its learning the way `teamai contribute` does, on the `teamai-learnings` branch: under `learnings/<namespace>/` when exactly one active project declares a learnings namespace, otherwise at the shared `learnings/` root. If that fails, the learning stays queued on this machine and the next `teamai pull` publishes it; when a learnings checkout teamai refuses stopped it, no pull can until you deal with that checkout as the message says.
+`--from-mr` publishes its learning the way `teamai contribute` does by default, on the `teamai-learnings` branch: under `learnings/<namespace>/` when the active projects resolve to exactly one learnings namespace, otherwise at the shared `learnings/` root. If that fails, the learning stays queued on this machine and the next `teamai pull` publishes it; when a learnings checkout teamai refuses stopped it, no pull can until you deal with that checkout as the message says.
 
 When the draft overlaps existing learnings, from the shared root or your active projects' namespaces, the command names them (`Possible duplicate: this learning overlaps N existing learning(s): <files>.`), with `--all` too. It is a notice only: nothing is marked or replaced. When `manifest/projects.yaml` cannot be read, the check compares the shared root only and says so.
 
