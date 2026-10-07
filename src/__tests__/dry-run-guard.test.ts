@@ -95,6 +95,10 @@ describe('--dry-run guard decisions', () => {
     expect(dryRunRefusal(command('ci extract-mr'))).toBeUndefined();
   });
 
+  it.each(['stats', 'recall'])('allows the merged %s preview', (path) => {
+    expect(dryRunRefusal(command(path))).toBeUndefined();
+  });
+
   it('keeps the merged feedback preview reachable independently of recall queries', () => {
     expect(dryRunRefusal(command('recall feedback'))).toBeUndefined();
   });
