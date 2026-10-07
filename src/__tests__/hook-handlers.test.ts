@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -244,6 +244,96 @@ describe('hook-handlers registry', () => {
     expect(mockPull).toHaveBeenCalledWith({ silent: true, inline: true, gitHook: 'post-merge', fetchTimeoutMs: 5000 });
   });
 
+  it.each(['rebase', 'amend'])('post-rewrite syncs only a completed rebase, not amend (%s)', async (rewrite) => {
+    const { createDispatcher } = await import('../hook-dispatch.js');
+    const dispatcher = createDispatcher({
+      handlers: buildHandlerRegistry(),
+      localConfig: {
+        scope: 'project', projectRoot: '/tmp/self-project', username: 'test', additionalRoles: [],
+        repo: { kind: 'self', localPath: '/tmp/self-project', remote: '' },
+      },
+    });
+    const result = await dispatcher.dispatch('post-rewrite', '*', {
+      cwd: '/tmp/self-project', hook_event_name: 'post-rewrite', git_args: [rewrite],
+    }, 'git');
+    expect(result.errors).toEqual([]);
+    expect(result.output).toBeNull();
+    if (rewrite === 'amend') expect(mockPull).not.toHaveBeenCalled();
+    else expect(mockPull).toHaveBeenCalledWith({ silent: true, inline: true, gitHook: 'post-rewrite', fetchTimeoutMs: 5000 });
+  });
+
+  // Git 2.14–2.32 runs a fast-forward `git pull --rebase` with autostash as a
+  // rebase that only checks out the upstream: no post-merge, no post-rewrite.
+  describe('post-checkout from a rebase that fast-forwards', () => {
+    let repo: string;
+    let base: string;
+    let ahead: string;
+    let side: string;
+    const savedAction = process.env.GIT_REFLOG_ACTION;
+
+    beforeAll(async () => {
+      const { execFileSync } = await import('node:child_process');
+      repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'git-hook-ff-rebase-')));
+      const git = (args: string[]) => execFileSync('git', args, {
+        cwd: repo, encoding: 'utf8',
+        env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
+      }).trim();
+      git(['init', '-q', '-b', 'main']);
+      git(['commit', '-q', '--allow-empty', '-m', 'base']);
+      base = git(['rev-parse', 'HEAD']);
+      git(['commit', '-q', '--allow-empty', '-m', 'upstream']);
+      ahead = git(['rev-parse', 'HEAD']);
+      git(['checkout', '-q', '-b', 'local', base]);
+      git(['commit', '-q', '--allow-empty', '-m', 'local']);
+      side = git(['rev-parse', 'HEAD']);
+    });
+    afterEach(() => {
+      if (savedAction === undefined) delete process.env.GIT_REFLOG_ACTION;
+      else process.env.GIT_REFLOG_ACTION = savedAction;
+    });
+    afterAll(() => fs.rmSync(repo, { recursive: true, force: true }));
+
+    const checkout = async (args: () => string[], action: string | undefined) => {
+      if (action === undefined) delete process.env.GIT_REFLOG_ACTION;
+      else process.env.GIT_REFLOG_ACTION = action;
+      const { createDispatcher } = await import('../hook-dispatch.js');
+      const dispatcher = createDispatcher({
+        handlers: buildHandlerRegistry(),
+        localConfig: {
+          scope: 'project', projectRoot: repo, username: 'test', additionalRoles: [],
+          repo: { kind: 'self', localPath: repo, remote: '' },
+        },
+      });
+      const result = await dispatcher.dispatch('post-checkout', '*', {
+        cwd: repo, hook_event_name: 'post-checkout', git_args: args(),
+      }, 'git');
+      expect(result.errors).toEqual([]);
+    };
+
+    it.each([
+      'pull --rebase --autostash (start): checkout origin/main',
+      'pull -q --rebase --autostash',
+      'rebase (start): checkout origin/main',
+      'rebase',
+    ])('syncs once, as a capped git pull recorded as post-checkout (GIT_REFLOG_ACTION=%s)', async (action) => {
+      await checkout(() => [base, ahead, '1'], action);
+      expect(mockPull).toHaveBeenCalledTimes(1);
+      expect(mockPull).toHaveBeenCalledWith({ silent: true, inline: true, gitHook: 'post-checkout', fetchTimeoutMs: 5000 });
+    });
+
+    it.each<[string, () => string[], string | undefined]>([
+      ['a divergent rebase (post-rewrite syncs it)', () => [side, ahead, '1'], 'pull --rebase'],
+      ['a checkout outside pull or rebase', () => [base, ahead, '1'], undefined],
+      ['an unknown reflog action', () => [base, ahead, '1'], 'pullish'],
+      ['a file checkout', () => [base, ahead, '0'], 'pull --rebase'],
+      ['an unchanged HEAD', () => [ahead, ahead, '1'], 'pull --rebase'],
+      ['arguments that are not object ids', () => ['--help', ahead, '1'], 'pull --rebase'],
+    ])('does not sync %s', async (_case, args, action) => {
+      await checkout(args, action);
+      expect(mockPull).not.toHaveBeenCalled();
+    });
+  });
+
   it('does not sync teamai\'s own knowledge worktree on post-checkout or post-merge', async () => {
     const { execFileSync } = await import('node:child_process');
     const main = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'git-hook-own-wt-')));
@@ -266,6 +356,7 @@ describe('hook-handlers registry', () => {
       await registry.find(r => r.event === 'post-checkout')!.handler.execute(
         { cwd: wt, git_args: ['0'.repeat(40), 'abc', '1'] }, 'git', config);
       await registry.find(r => r.event === 'post-merge')!.handler.execute({ cwd: wt, git_args: ['0'] }, 'git', config);
+      await registry.find(r => r.event === 'post-rewrite')!.handler.execute({ cwd: wt, hook_event_name: 'post-rewrite', git_args: ['rebase'] }, 'git', config);
       expect(mockPull).not.toHaveBeenCalled();
     } finally {
       fs.rmSync(main, { recursive: true, force: true });

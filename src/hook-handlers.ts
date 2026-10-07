@@ -13,6 +13,7 @@ import path from 'node:path';
 
 import type { HookHandler } from './hook-dispatch.js';
 import type { LocalConfig } from './types.js';
+import type { GitHookEvent } from './git-hook.js';
 import { deriveDispatchSessionId, deriveSessionId } from './utils/session-id.js';
 import { log } from './utils/logger.js';
 import { normalizeToolName } from './utils/tool-names.js';
@@ -170,13 +171,14 @@ const newWorktreeHandler: HookHandler = {
   },
 };
 
-/** How long `git pull` waits for the post-merge hook's team repo fetch. */
-const POST_MERGE_FETCH_CAP_MS = 5_000;
+/** How long `git pull` waits for its hook's team repo fetch. */
+const GIT_PULL_FETCH_CAP_MS = 5_000;
 
 /**
- * `post-merge` from the git hook (`git pull`): the next session gets what
+ * `post-merge`, `post-rewrite` after a rebase, or `post-checkout` from a rebase
+ * that only fast-forwarded (`git pull`, see isRebaseFastForward): the next session gets what
  * changed. With a separate team repo, the team repo is fetched inline within
- * POST_MERGE_FETCH_CAP_MS and delivered when its revision moved (the rev fast
+ * GIT_PULL_FETCH_CAP_MS and delivered when its revision moved (the rev fast
  * path skips it otherwise); past the cap, and for learnings, reports and
  * sources, a detached pull takes over. In single-repo (self) mode the team
  * repo is the working tree `git pull` just updated: delivered with no network.
@@ -185,7 +187,15 @@ const gitPullHandler: HookHandler = {
   name: 'git-pull',
   async execute(stdin, _tool, config) {
     if (!config || config.scope !== 'project') return null;
+    const event = stdin.hook_event_name === 'post-rewrite' || stdin.hook_event_name === 'post-checkout'
+      ? stdin.hook_event_name : 'post-merge';
+    const args = Array.isArray(stdin.git_args) ? stdin.git_args.map(String) : [];
+    if (event === 'post-rewrite' && args[0] !== 'rebase') return null;
     const cwd = resolveHookCwd(stdin) ?? process.cwd();
+    if (event === 'post-checkout') {
+      const { isRebaseFastForward } = await import('./git-hook.js');
+      if (!await isRebaseFastForward(args, process.env.GIT_REFLOG_ACTION, cwd)) return null;
+    }
     const { getDataHome, isSelfMode } = await import('./types.js');
     const self = isSelfMode(config);
     // teamai's own checkouts; in self mode the team repo is the member's.
@@ -193,10 +203,10 @@ const gitPullHandler: HookHandler = {
     if (await isWithin(cwd, self ? own : [...own, config.repo.localPath])) return null;
 
     const { pull } = await import('./pull.js');
-    await recordingFailure(config, 'post-merge', () => pull({
-      silent: true, inline: true, gitHook: 'post-merge', fetchTimeoutMs: POST_MERGE_FETCH_CAP_MS,
+    await recordingFailure(config, event, () => pull({
+      silent: true, inline: true, gitHook: event, fetchTimeoutMs: GIT_PULL_FETCH_CAP_MS,
     }));
-    if (!self) await spawnDetachedPull(cwd, 'post-merge');
+    if (!self) await spawnDetachedPull(cwd, event);
     return null;
   },
 };
@@ -207,7 +217,7 @@ const gitPullHandler: HookHandler = {
  */
 async function recordingFailure(
   config: LocalConfig,
-  event: 'post-checkout' | 'post-merge',
+  event: GitHookEvent,
   pass: () => Promise<unknown>,
 ): Promise<void> {
   try {
@@ -223,7 +233,7 @@ async function recordingFailure(
  * for. TEAMAI_GIT_HOOK makes it record its failure, and clear the record when it
  * succeeds.
  */
-async function spawnDetachedPull(cwd: string, event: 'post-checkout' | 'post-merge'): Promise<void> {
+async function spawnDetachedPull(cwd: string, event: GitHookEvent): Promise<void> {
   const { resolveCliEntry } = await import('./builtin-hooks.js');
   const { spawn } = await import('node:child_process');
   spawn(process.execPath, [resolveCliEntry() ?? '', 'pull', '--silent'], {
@@ -1106,10 +1116,12 @@ export function buildHandlerRegistry(): HandlerRegistration[] {
 
     // ─── Git (`--tool git`, see git-hook.ts) ──────────
     // Inline: the delivery has to land before `git worktree add` returns. Git
-    // has no hook timeout, so the budget is the detached pull's; post-merge
-    // caps its own fetch.
+    // has no hook timeout, so the budget is the detached pull's; git-pull hooks
+    // cap their own fetch.
     { event: 'post-checkout', matcher: '*', handler: newWorktreeHandler, timeoutMs: PULL_TIMEOUT_MS, requiresConfig: true },
+    { event: 'post-checkout', matcher: '*', handler: gitPullHandler, timeoutMs: PULL_TIMEOUT_MS, requiresConfig: true },
     { event: 'post-merge', matcher: '*', handler: gitPullHandler, timeoutMs: PULL_TIMEOUT_MS, requiresConfig: true },
+    { event: 'post-rewrite', matcher: '*', handler: gitPullHandler, timeoutMs: PULL_TIMEOUT_MS, requiresConfig: true },
   ];
 }
 
