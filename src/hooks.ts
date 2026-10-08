@@ -355,6 +355,27 @@ function canonicalProjectRoot(projectRoot: string): string {
 }
 
 /**
+ * The same project root as the shell that runs the hook names its cwd.
+ *
+ * On Windows every hook runner is an MSYS shell — CodeBuddy's required Git
+ * Bash, WorkBuddy's bundled PortableGit — and MSYS exposes a drive-letter path
+ * as `/c/proj`, never as the `C:\proj` a Windows path resolves to. A gate that
+ * compares `$PWD` against the Windows spelling therefore never matches, and the
+ * project's team hooks silently never run: `canonicalProjectRoot()` returns the
+ * native form, so the comparison has to be made in the form the shell uses.
+ *
+ * Drive roots lose their trailing separator (`C:\` → `/c`), which is how MSYS
+ * spells them. A path that already has no drive letter (Linux, macOS) is
+ * returned unchanged, and so is a UNC path (`\\server\share`), whose MSYS form
+ * this does not attempt.
+ */
+function msysProjectRoot(root: string): string {
+  const drive = /^([A-Za-z]):[\\/]*(.*)$/.exec(root);
+  if (!drive) return root;
+  return `/${drive[1].toLowerCase()}/${drive[2].replace(/\\/g, '/')}`.replace(/\/+$/, '') || '/';
+}
+
+/**
  * Embed a Windows path in a cmd.exe command line so the child receives it
  * byte-for-byte.
  *
@@ -410,14 +431,26 @@ function cmdProjectGate(root: string): string {
  * a gate mismatch that returned non-zero would make CodeBuddy read the hook as
  * `allowed:false` and BLOCK every UserPromptSubmit outside the project.
  *
+ * A Windows root is tested in both spellings. The shell names its cwd the MSYS
+ * way (`/c/proj`); the native form is kept because it is what previous versions
+ * wrote, so a re-render recognises and replaces those entries instead of
+ * stacking a second gate beside them. On a non-Windows root the two forms are
+ * identical and the gate carries one test.
+ *
  * Legacy cmd.exe gates are still recognised on read by isGatedForProject(), so
  * a re-render replaces 0.26.0's cmd gate instead of stacking a second one.
  */
 function gateTeamHookCommand(command: string, projectRoot: string | undefined): string {
   if (!projectRoot) return command;
   const root = canonicalProjectRoot(projectRoot);
+  const msys = msysProjectRoot(root);
   const quoted = shellQuote(root);
-  return `if [ "$PWD" = ${quoted} ] || case "$PWD" in ${quoted}/*) true;; *) false;; esac; then (${command}); fi`;
+  if (msys === root) {
+    return `if [ "$PWD" = ${quoted} ] || case "$PWD" in ${quoted}/*) true;; *) false;; esac; then (${command}); fi`;
+  }
+  const shellQuoted = shellQuote(msys);
+  return `if [ "$PWD" = ${quoted} ] || [ "$PWD" = ${shellQuoted} ]`
+    + ` || case "$PWD" in ${quoted}/*|${shellQuoted}/*) true;; *) false;; esac; then (${command}); fi`;
 }
 
 /** Recognise a project gate written by either renderer (entries outlive a platform switch). */
@@ -447,7 +480,14 @@ function skipWhenAnotherHostLoadsClaudeSettings(command: string, tool: string): 
   return `${CLAUDE_HOOK_OTHER_HOST_SKIP}${command}`;
 }
 
-const POSIX_GATE_ROOT_RE = /^if \[ "\$PWD" = ('(?:[^']|'"'"')*') \] \|\| case "\$PWD" in /;
+/**
+ * Matches a POSIX gate and captures its *first* quoted root, which is always
+ * the native spelling: on Windows the MSYS spelling follows as an optional
+ * second test, on a non-Windows root the two are the same and only one is
+ * written. Reading the native form back keeps the root comparable with the
+ * Windows paths the callers hold.
+ */
+const POSIX_GATE_ROOT_RE = /^if \[ "\$PWD" = ('(?:[^']|'"'"')*') \](?: \|\| \[ "\$PWD" = '(?:[^']|'"'"')*' \])? \|\| case "\$PWD" in /;
 
 /**
  * The project root a POSIX gate was rendered for, or null for an ungated or

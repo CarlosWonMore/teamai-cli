@@ -15,6 +15,8 @@ vi.mock('../utils/logger.js', () => ({
 
 import { resolveAnchors, listWorktrees } from '../utils/git.js';
 import { resetBundledRuntimeCache } from '../bundled-runtime.js';
+import { findOnPath } from '../utils/lookpath.js';
+import { spawn } from 'node:child_process';
 import { CLAUDE_HOOK_OTHER_HOST_SKIP, reconcileTeamHooksForConfig } from '../hooks.js';
 import * as gitHook from '../git-hook.js';
 import type { LocalConfig, TeamaiConfig } from '../types.js';
@@ -924,13 +926,18 @@ describe('reconcileTeamHooksForConfig — legacy projectRoot sweep', () => {
   });
 });
 
-// ── Project gate rendering per host shell ────────────────────
+// ── Project gate: what it renders, and whether it actually fires ─
 //
-// A tool whose Windows hook runner is cmd.exe cannot execute a POSIX
-// `if [ "$PWD" ... ]` gate: cmd aborts on that syntax, so the whole team hook —
-// gate and payload alike — never runs. CodeBuddy's runner is Git Bash, not
-// cmd.exe, so every tool gets the POSIX gate now.
-describe('project gate rendering per host shell', () => {
+// Every hook runner is a POSIX shell — CodeBuddy's Git Bash, WorkBuddy's
+// bundled PortableGit, `bash -lc` for the rest — so the gate is always the
+// POSIX form. A cmd.exe gate would not run there at all: `findstr` errors out
+// and the `>nul` redirect leaves a file named `nul` in the project.
+//
+// On Windows that shell names its cwd `/c/proj`, never the `C:\proj` the root
+// resolves to, so the gate carries both spellings. The cases below check the
+// shape; the last one runs a rendered gate through a real shell, which is the
+// only way a gate that can never match is caught.
+describe('project gate — rendering and real-shell execution', () => {
   const codebuddyOnly = {
     toolPaths: { codebuddy: { settings: '.codebuddy/settings.json' } },
   } as unknown as TeamaiConfig;
@@ -990,6 +997,16 @@ hooks:
       const [command] = await teamStopCommands('.codebuddy/settings.json');
       expect(command.startsWith('if [ "$PWD" = ')).toBe(true);
       expect(command.endsWith('); fi')).toBe(true);
+      // The runner names its cwd the MSYS way: on Windows that is `/c/...`,
+      // never the `C:\...` this root resolves to, so the gate must carry both
+      // spellings or it silently never fires. A root without a drive letter is
+      // already the shell's spelling and the gate carries a single test, which
+      // is what the suite's Linux and macOS jobs exercise.
+      if (/^[A-Za-z]:[\\/]/.test(project)) {
+        expect(command, 'a Windows root is tested in both spellings').toMatch(/\] \|\| \[ "\$PWD" = '\/[a-z]\//);
+      } else {
+        expect(command, 'a POSIX root needs one spelling').not.toContain(' || [ "$PWD" = ');
+      }
       // 0.26.0 rendered a cmd.exe gate here. Git Bash cannot run it: `findstr`
       // errors out, the gate never matches, and the `>nul` redirect leaves a
       // file literally named `nul` in the project.
@@ -1017,4 +1034,104 @@ hooks:
       platformSpy.mockRestore();
     }
   });
+
+  /**
+   * A real POSIX shell to run the gate with. Deliberately not the placeholder
+   * `bash.exe` staged above: that file only has to make
+   * `resolveCodebuddyShell()` report a shell and cannot execute anything. This
+   * is the MSYS bash the machine actually has on PATH, found through the real
+   * environment the staging did not touch.
+   */
+  const executor = process.platform === 'win32' ? findOnPath('bash') : '/bin/sh';
+
+  /**
+   * Where these cases build their directories — deliberately outside
+   * `os.tmpdir()`. MSYS mounts the Windows temp directory at `/tmp`, so a root
+   * under it is reported as `/tmp/...` and no gate rendered from its native
+   * path can ever match it. `node_modules` sits on the workspace drive, which
+   * is what a real project looks like, and is never committed.
+   */
+  const execBase = path.join(process.cwd(), 'node_modules');
+
+  /** Render the gate for `root` and read it back off the tool's settings file. */
+  async function renderGate(root: string): Promise<string> {
+    // A fresh file per call: entries for another root are kept by design, and
+    // this reads back exactly the gate just rendered.
+    await fse.remove(path.join(home, '.codebuddy', 'settings.json'));
+    await writeYaml(`
+hooks:
+  - id: gate
+    description: gate probe
+    event: Stop
+    matcher: "*"
+    command: echo TEAMAI_GATE_PAYLOAD
+    tools: [codebuddy]
+`);
+    await fse.ensureDir(path.join(home, '.codebuddy'));
+    await reconcileTeamHooksForConfig(codebuddyOnly, { ...localConfig(), projectRoot: root } as LocalConfig);
+    const [command] = await teamStopCommands('.codebuddy/settings.json');
+    expect(command).toBeDefined();
+    return command;
+  }
+
+  /**
+   * Run a rendered hook command the way the runner does: through its shell.
+   * Async rather than `spawnSync` because a sandbox can fail the synchronous
+   * spawn with EBUSY, which would show up here as an empty stdout — the exact
+   * signature of a gate that never matched.
+   */
+  function runCommand(command: string, cwd: string): Promise<{ status: number | null; stdout: string }> {
+    return new Promise((resolve) => {
+      const child = spawn(executor!, ['-c', command], { cwd });
+      let stdout = '';
+      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk; });
+      child.on('close', (status) => resolve({ status, stdout }));
+      child.on('error', () => resolve({ status: null, stdout }));
+    });
+  }
+
+  it.skipIf(!executor)(
+    'fires inside the project and stays an exit-0 no-op outside it, under a real shell',
+    async () => {
+      const execRoot = await fse.mkdtemp(path.join(execBase, '.teamai-gate-'));
+      try {
+        // `sp&x` and `x&echo CANARY&y` carry the characters that would split the
+        // command if the gate did not quote the root; `sp ace` covers the space.
+        for (const name of ['plain', 'sp&x', 'sp ace', 'x&echo CANARY&y']) {
+          const root = path.join(execRoot, name);
+          const sub = path.join(root, 'sub');
+          const sibling = path.join(execRoot, `${name}-sibling`);
+          await fse.ensureDir(sub);
+          await fse.ensureDir(sibling);
+          const command = await renderGate(root);
+
+          // Inside: the gate matches and the payload runs. A gate rendered in
+          // the native spelling only would silently never do this.
+          for (const cwd of [root, sub]) {
+            const { status, stdout } = await runCommand(command, cwd);
+            expect(stdout, `${name} inside ${cwd}`).toContain('TEAMAI_GATE_PAYLOAD');
+            expect(status, `${name} inside ${cwd}`).toBe(0);
+            // A `&` in the directory name must never split the gate into
+            // commands — the payload's own output is the canary for that.
+            expect(stdout, `${name} injection canary`).not.toMatch(/^\s*CANARY\s*$/m);
+          }
+          // Outside: nothing runs, and the gate still exits 0 — CodeBuddy reads
+          // a non-zero hook status as `allowed:false` and would block every
+          // prompt typed outside the project.
+          for (const cwd of [execRoot, sibling]) {
+            const { status, stdout } = await runCommand(command, cwd);
+            expect(stdout, `${name} outside ${cwd}`).not.toContain('TEAMAI_GATE_PAYLOAD');
+            expect(status, `${name} outside ${cwd}`).toBe(0);
+          }
+        }
+      } finally {
+        // Some sandboxes refuse the bulk delete; a leftover empty directory
+        // under node_modules is harmless.
+        await fse.remove(execRoot).catch(() => {});
+      }
+    },
+    // A Windows runner starts a fresh MSYS bash per call, which is far slower
+    // than the cmd.exe the gate used to be tested with.
+    60_000,
+  );
 });
